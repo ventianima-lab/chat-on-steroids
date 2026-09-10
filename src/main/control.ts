@@ -15,6 +15,7 @@ import { getConfig } from './config.js';
 import { listProjects } from './projects.js';
 import { cancelDesktopInput, sendDesktopInput } from './session/start-input.js';
 import { inputArgs, listInputs, type InputArgs, type InputEntry } from './session/input.js';
+import { snapshotContinuations } from './session/continuation.js';
 import { getSession, listSessionPage, readOverflowText, readRecentEvents, type SessionListCursor } from './session/store.js';
 import { stopSessionTurn } from './bridge.js';
 import { APP_VERSION } from './version.js';
@@ -58,6 +59,16 @@ export interface ControlDependencies {
   session(id: string): Promise<SessionSummary | null>;
   sessions(options: { limit?: number; cursor?: SessionListCursor }): Promise<{ sessions: SessionSummary[]; total: number; nextCursor: SessionListCursor | null }>;
   events(id: string): Promise<SessionEvent[]>;
+  continuations(): ReadonlyArray<{
+    sourceTurnId: string | null;
+    token: string;
+    sessionId: string;
+    openedAt: number;
+    automatic: boolean;
+    state: 'awaiting-summary' | 'awaiting-chat' | 'claimed' | 'committing' | 'committed' | 'aborted';
+    error: string | null;
+    destinationSend: { state: string; conversationId: string | null; messageId: string | null };
+  }>;
   overflow(id: string, assetId: string): Promise<string | null>;
   stop(id: string, turnId: string): Promise<unknown>;
   recording(): boolean;
@@ -78,6 +89,18 @@ const productionDependencies: ControlDependencies = {
   session: getSession,
   sessions: listSessionPage,
   events: id => readRecentEvents(id, 512, { kinds: ['user_message', 'assistant_message', 'turn_start', 'turn_end', 'chat_error'] }),
+  continuations: () => snapshotContinuations().entries.map(entry => ({
+    sourceTurnId: entry.sourceTurnId ?? null,
+    token: entry.token,
+    sessionId: entry.sessionId,
+    openedAt: entry.openedAt,
+    automatic: entry.automatic === true,
+    state: entry.state,
+    error: entry.error,
+    destinationSend: entry.destinationSend
+      ? { ...entry.destinationSend }
+      : { state: 'not-attempted', conversationId: null, messageId: null }
+  })),
   overflow: readOverflowText,
   stop: stopSessionTurn,
   recording: () => getConfig().sessions.record,
@@ -94,6 +117,51 @@ function targetSessionId(entry: InputEntry): string | null {
   return entry.sessionId ?? entry.deliveredSessionId ?? null;
 }
 
+interface RequestLifecycle {
+  span: SessionEvent[];
+  nextUser: number;
+  pendingContinuation: boolean;
+  continuationError: string | null;
+}
+
+/**
+ * Follow only stock automatic Compact & Resume records sourced from this request's exact turn.
+ * The handoff answer and marked bootstrap message are transport records, not a result or a new
+ * user ownership boundary. All other later user messages still supersede the controller request.
+ */
+function requestLifecycle(
+  deps: ControlDependencies,
+  entry: InputEntry,
+  events: SessionEvent[],
+  authored: number,
+  sessionId: string
+): RequestLifecycle {
+  let start = authored + 1;
+  const seen = new Set<string>();
+  const continuations = deps.continuations()
+    .filter(row => row.sessionId === sessionId && row.automatic && row.openedAt >= (entry.deliveredAt ?? entry.createdAt))
+    .sort((a, b) => a.openedAt - b.openedAt || a.token.localeCompare(b.token));
+  for (;;) {
+    const nextUser = events.findIndex((event, index) => index >= start && event.kind === 'user_message');
+    const span = events.slice(start, nextUser < 0 ? undefined : nextUser);
+    const generationIds = new Set(span.flatMap(event => event.kind === 'turn_start' && event.turnId ? [event.turnId] : []));
+    const continuation = continuations.find(row => !seen.has(row.token) && !!row.sourceTurnId && generationIds.has(row.sourceTurnId));
+    if (!continuation) return { span, nextUser, pendingContinuation: false, continuationError: null };
+    seen.add(continuation.token);
+    if (continuation.state === 'aborted') {
+      return { span, nextUser, pendingContinuation: false,
+        continuationError: continuation.error || 'ChatGPT automatic continuation failed' };
+    }
+    const destinationMessageId = continuation.destinationSend.messageId;
+    if (continuation.state !== 'committed' || !destinationMessageId) {
+      return { span, nextUser, pendingContinuation: true, continuationError: null };
+    }
+    const destination = events.findIndex((event, index) => index >= start && event.kind === 'user_message' && event.messageId === destinationMessageId);
+    if (destination < 0) return { span, nextUser, pendingContinuation: true, continuationError: null };
+    start = destination + 1;
+  }
+}
+
 /** Return the live generation only when it follows this exact controller input and no later user input. */
 async function exactActiveRequestTurn(
   deps: ControlDependencies,
@@ -104,8 +172,9 @@ async function exactActiveRequestTurn(
   const events = await deps.events(summary.id);
   const authored = events.findIndex(event => event.kind === 'user_message' && event.inputId === entry.id);
   if (authored < 0) return null;
-  const nextUser = events.findIndex((event, index) => index > authored && event.kind === 'user_message');
-  const span = events.slice(authored + 1, nextUser < 0 ? undefined : nextUser);
+  const lifecycle = requestLifecycle(deps, entry, events, authored, summary.id);
+  if (lifecycle.continuationError) return null;
+  const span = lifecycle.span;
   return span.some(event => event.kind === 'turn_start' && event.turnId === summary.activeTurnId)
     ? summary.activeTurnId : null;
 }
@@ -142,8 +211,8 @@ export async function controlRequestView(deps: ControlDependencies, entry: Input
   };
   if (entry.state !== 'sent' || !sessionId) return base;
   if (authored < 0) return base;
-  const nextUser = events.findIndex((event, index) => index > authored && event.kind === 'user_message');
-  const span = events.slice(authored + 1, nextUser < 0 ? undefined : nextUser);
+  const lifecycle = requestLifecycle(deps, entry, events, authored, sessionId);
+  const { span, nextUser } = lifecycle;
   // The exact outbox row is the request boundary; when the recorder also captured the
   // generation start, use that stronger identity to reject terminal evidence from a stale
   // or overlapping turn in the same browser observation window. User-message ids and
@@ -152,6 +221,8 @@ export async function controlRequestView(deps: ControlDependencies, entry: Input
   const generationIds = new Set(span.flatMap(event => event.kind === 'turn_start' && event.turnId ? [event.turnId] : []));
   const belongsToGeneration = (event: SessionEvent): boolean =>
     generationIds.size === 0 || !event.turnId || generationIds.has(event.turnId);
+  if (lifecycle.continuationError) return { ...base, state: 'failed', error: lifecycle.continuationError };
+  if (lifecycle.pendingContinuation) return base;
   const final = span.find(event => event.kind === 'assistant_message' && belongsToGeneration(event) &&
     (event.final === true || event.state === 'final'));
   if (final?.kind === 'assistant_message' && verifiedSelection) {
