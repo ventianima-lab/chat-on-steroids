@@ -9,13 +9,23 @@ function harness() {
   class Clock extends Date { static override now() { return now; } }
   let response: unknown;
   let nextBodyGate: Promise<void> | null = null;
-  let listener: (event: unknown) => void = () => {};
+  const listeners = new Map<string, Array<{ handler: (event: unknown) => void; once: boolean }>>();
+  const document = { readyState: 'loading' };
   const window = {
     fetch: (..._args: unknown[]) => Promise.resolve(response),
     postMessage: (data: unknown) => posts.push(JSON.parse(JSON.stringify(data))),
-    addEventListener: (_type: string, handler: typeof listener) => { listener = handler; }
+    addEventListener: (type: string, handler: (event: unknown) => void, options?: { once?: boolean }) => {
+      const rows = listeners.get(type) ?? [];
+      rows.push({ handler, once: options?.once === true });
+      listeners.set(type, rows);
+    }
   };
-  runInNewContext(script, { window, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder, setTimeout, clearTimeout });
+  const dispatch = (type: string, event: unknown) => {
+    const rows = listeners.get(type) ?? [];
+    listeners.set(type, rows.filter(row => !row.once));
+    for (const row of rows) row.handler(event);
+  };
+  runInNewContext(script, { window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder, setTimeout, clearTimeout });
   async function feed(data: unknown, url = 'https://chatgpt.com/backend-api/wham/usage', init: Record<string, unknown> = {}) {
     let done: () => void = () => {};
     const inspected = new Promise<void>(resolve => { done = resolve; });
@@ -52,7 +62,21 @@ function harness() {
     if (String(init.method || 'GET').toUpperCase() === 'POST') await inspected;
     else await new Promise(resolve => setTimeout(resolve, 0));
   }
-  return { posts, feed, feedSse, holdNextBody: () => { let release = () => {}; nextBodyGate = new Promise<void>(resolve => { release = resolve; }); return () => release(); }, advance: (ms: number) => { now += ms; }, request: (source: unknown = window, origin = 'https://chatgpt.com') => listener({ source, origin, data: { type: 'cos-usage-request' } }) };
+  return {
+    posts,
+    feed,
+    feedSse,
+    replaceFetch: () => {
+      const replacement = (..._args: unknown[]) => Promise.resolve(response);
+      window.fetch = replacement;
+      return replacement;
+    },
+    ready: () => { document.readyState = 'interactive'; dispatch('DOMContentLoaded', {}); },
+    currentFetch: () => window.fetch,
+    holdNextBody: () => { let release = () => {}; nextBodyGate = new Promise<void>(resolve => { release = resolve; }); return () => release(); },
+    advance: (ms: number) => { now += ms; },
+    request: (source: unknown = window, origin = 'https://chatgpt.com') => dispatch('message', { source, origin, data: { type: 'cos-usage-request' } })
+  };
 }
 
 describe('MAIN-world usage projection', () => {
@@ -167,6 +191,21 @@ describe('MAIN-world usage projection', () => {
     ]);
     expect(JSON.stringify(h.posts)).not.toContain('private prompt');
     expect(JSON.stringify(h.posts)).not.toContain('tool args');
+  });
+
+  it('reattaches after the page runtime replaces fetch during startup', async () => {
+    const h = harness();
+    const replacement = h.replaceFetch();
+    expect(h.currentFetch()).toBe(replacement);
+    h.ready();
+    expect(h.currentFetch()).not.toBe(replacement);
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+    await h.feedSse([`data: {"conversation_id":"${conversationId}","metadata":{"request_id":"wfr_after_runtime_wrap"}}\n\n`]);
+
+    expect(h.posts).toEqual([
+      { type: 'cos-request-origin', conversationId, requestIds: ['wfr_after_runtime_wrap'], observedAt: expect.any(Number) }
+    ]);
   });
 
   it('ignores non-POST, foreign, malformed and contradictory stream identity', async () => {
