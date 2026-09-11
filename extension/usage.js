@@ -11,7 +11,7 @@
   'use strict';
   if (window.__cosUsageObserver) return;
   window.__cosUsageObserver = true;
-  let originalFetch = window.fetch;
+  const originalFetch = window.fetch;
   const post = window.postMessage.bind(window);
   let latest = null;
   let requestOrder = 0, latestOrder = 0;
@@ -132,7 +132,7 @@
     } catch { /* A missing stream observation leaves the existing Fiber path in charge. */ }
     finally { clearTimeout(timer); void reader.cancel().catch(() => {}); }
   }
-  const observedFetch = function (...args) {
+  window.fetch = function (...args) {
     // Request order fences late responses, not accounts. No account identity is inferred.
     const observedAt = Date.now(), order = ++requestOrder;
     const result = originalFetch.apply(this, args);
@@ -148,18 +148,6 @@
     }).catch(() => {});
     return result;
   };
-  const installFetchObserver = () => {
-    if (window.fetch === observedFetch || typeof window.fetch !== 'function') return;
-    // ChatGPT installs its own fetch instrumentation after document_start. Keep that owner in
-    // the chain and reattach once at the page-ready boundary; otherwise our flag remains set
-    // while the live response observer has silently been replaced.
-    originalFetch = window.fetch;
-    window.fetch = observedFetch;
-  };
-  installFetchObserver();
-  if (document.readyState === 'loading') {
-    window.addEventListener('DOMContentLoaded', installFetchObserver, { once: true });
-  }
   window.addEventListener('message', (event) => {
     if (event.source === window && event.origin === location.origin && event.data?.type === 'cos-usage-request' && latest) post(latest, location.origin);
   });
